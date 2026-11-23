@@ -34,14 +34,14 @@
  * Version & constants (single source of truth; no imports allowed —  *
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
-export const PLUGIN_VERSION = "0.2.4-tools.3";
+export const PLUGIN_VERSION = "0.2.4-tools.4";
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
 const PROVIDER_ID = "cloudbase";
 const PROVIDER_ID_FALLBACK_PREFIX = "cloudbase-plugin/";
 const DEFAULT_FUNCTION_NAME = "aiProxy";
 const DEFAULT_TIMEOUT_MS = 150_000; // gateway invoke waits for the function; keep above the recommended 120 s function timeout
-const DEFAULT_MAX_EVENT_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_EVENT_BYTES = 8 * 1024 * 1024;
 const SSE_CHUNK_CHARS = 200;
 const USER_AGENT = `opencode-cloudbase-bridge/${PLUGIN_VERSION}`;
 const GATEWAY_SUFFIX_CN = ".api.tcloudbasegateway.com";
@@ -278,8 +278,61 @@ function mapFunctionError(err, requestId) {
 /* ------------------------------------------------------------------ *
  * Chat Completions <-> aiProxy adapters.                             *
  * ------------------------------------------------------------------ */
+/**
+ * PATCH (tools.4): shrink bloated history before invoking the function.
+ * Long aicode threads accumulate base64 images (viewImage results, user
+ * uploads) and huge tool outputs, and every request re-sends all of it
+ * until the payload cap kills the turn (413, seen live at 4.68 MB).
+ * In older messages, image data and oversized contents are replaced by
+ * short placeholders; roles, structure and tool_call ids are preserved
+ * so tool pairing stays valid. The most recent messages pass untouched.
+ */
+const KEEP_RECENT_MESSAGES = 8;
+const OLD_CONTENT_LIMIT = 4000;
+const HUGE_PART_BYTES = 200_000;
+function shrinkOldText(s) {
+    if (s.startsWith("data:image/") || s.length > HUGE_PART_BYTES)
+        return "[图片数据已省略]";
+    if (s.length > OLD_CONTENT_LIMIT)
+        return s.slice(0, OLD_CONTENT_LIMIT) + "\n[内容过长已截断]";
+    return s;
+}
+function shrinkOldMessage(m) {
+    if (!isPlainObject(m))
+        return m;
+    const out = { ...m };
+    const c = m.content;
+    if (typeof c === "string") {
+        out.content = shrinkOldText(c);
+    }
+    else if (Array.isArray(c)) {
+        out.content = c.map((p) => {
+            if (!isPlainObject(p))
+                return p;
+            if (p.type === "image_url" || p.type === "image")
+                return { type: "text", text: "[图片已省略]" };
+            if (p.type === "text" && typeof p.text === "string")
+                return { ...p, text: shrinkOldText(p.text) };
+            let serialized = "";
+            try {
+                serialized = JSON.stringify(p);
+            }
+            catch { /* keep part as-is */ }
+            if (serialized.length > HUGE_PART_BYTES)
+                return { type: "text", text: "[内容已省略]" };
+            return p;
+        });
+    }
+    return out;
+}
+function sanitizeMessages(messages) {
+    if (!Array.isArray(messages) || messages.length <= KEEP_RECENT_MESSAGES)
+        return messages;
+    const cutoff = messages.length - KEEP_RECENT_MESSAGES;
+    return messages.map((m, i) => (i < cutoff ? shrinkOldMessage(m) : m));
+}
 function buildInvokeEvent(body, model) {
-    const event = { action: "chat", model, messages: body.messages };
+    const event = { action: "chat", model, messages: sanitizeMessages(body.messages) };
     if (typeof body.temperature === "number" && Number.isFinite(body.temperature)) {
         event.temperature = body.temperature;
     }
@@ -844,6 +897,7 @@ export const _internal = {
     normalizeModel,
     resolveAccountConfig,
     buildInvokeEvent,
+    sanitizeMessages,
     normalizeCompletion,
     chunkText,
     sseResponse,
