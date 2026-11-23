@@ -34,14 +34,14 @@
  * Version & constants (single source of truth; no imports allowed —  *
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
-export const PLUGIN_VERSION = "0.2.4";
+export const PLUGIN_VERSION = "0.2.4-tools.1";
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
 const PROVIDER_ID = "cloudbase";
 const PROVIDER_ID_FALLBACK_PREFIX = "cloudbase-plugin/";
 const DEFAULT_FUNCTION_NAME = "aiProxy";
 const DEFAULT_TIMEOUT_MS = 150_000; // gateway invoke waits for the function; keep above the recommended 120 s function timeout
-const DEFAULT_MAX_EVENT_BYTES = 512 * 1024;
+const DEFAULT_MAX_EVENT_BYTES = 4 * 1024 * 1024;
 const SSE_CHUNK_CHARS = 200;
 const USER_AGENT = `opencode-cloudbase-bridge/${PLUGIN_VERSION}`;
 const GATEWAY_SUFFIX_CN = ".api.tcloudbasegateway.com";
@@ -277,9 +277,20 @@ function buildInvokeEvent(body, model) {
     if (typeof body.top_p === "number" && Number.isFinite(body.top_p)) {
         event.topP = body.top_p;
     }
-    // NOTE: `max_tokens` and `tools` are intentionally not forwarded: the
-    // documented @cloudbase/node-sdk generateText input carries
-    // { model, messages, temperature?, topP? } only (see README limitations).
+    // PATCH (local fork): forward `max_tokens`, `tools` and `tool_choice`.
+    // The stock plugin intentionally dropped them because the original
+    // aiProxy (v1) only did plain generateText. The deployed aiProxy v2+
+    // accepts tools (it registers them with the CloudBase SDK and returns
+    // OpenAI-style tool_calls) and honours max_tokens, so pass them through.
+    if (typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens)) {
+        event.max_tokens = body.max_tokens;
+    }
+    if (Array.isArray(body.tools) && body.tools.length > 0) {
+        event.tools = body.tools;
+    }
+    if (typeof body.tool_choice !== "undefined") {
+        event.tool_choice = body.tool_choice;
+    }
     return event;
 }
 /**
@@ -297,6 +308,10 @@ function normalizeCompletion(value) {
         return null;
     const message = isPlainObject(first.message) ? first.message : null;
     const content = message && typeof message.content === "string" ? message.content : "";
+    // PATCH: keep structured tool_calls instead of dropping them.
+    const toolCalls = message && Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+        ? message.tool_calls.filter(isPlainObject)
+        : null;
     const finishReason = typeof first.finish_reason === "string" ? first.finish_reason : "stop";
     const usage = isPlainObject(value.usage)
         ? {
@@ -310,6 +325,7 @@ function normalizeCompletion(value) {
         created: typeof value.created === "number" ? value.created : Math.floor(Date.now() / 1000),
         model: typeof value.model === "string" ? value.model : "",
         content,
+        toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : null,
         finishReason,
         usage,
     };
@@ -351,6 +367,36 @@ function sseResponse(completion, echoModel) {
                 for (const piece of chunkText(completion.content, SSE_CHUNK_CHARS)) {
                     send(chunkFrame(base, { content: piece }, null));
                 }
+                // PATCH: stream tool_calls as OpenAI-style deltas (one header frame
+                // with id/name, one frame carrying the full arguments string).
+                if (completion.toolCalls) {
+                    completion.toolCalls.forEach((call, i) => {
+                        const fn = isPlainObject(call.function) ? call.function : {};
+                        send(chunkFrame(base, {
+                            tool_calls: [
+                                {
+                                    index: i,
+                                    id: typeof call.id === "string" ? call.id : `call_${i}`,
+                                    type: "function",
+                                    function: {
+                                        name: typeof fn.name === "string" ? fn.name : "",
+                                        arguments: "",
+                                    },
+                                },
+                            ],
+                        }, null));
+                        send(chunkFrame(base, {
+                            tool_calls: [
+                                {
+                                    index: i,
+                                    function: {
+                                        arguments: typeof fn.arguments === "string" ? fn.arguments : "",
+                                    },
+                                },
+                            ],
+                        }, null));
+                    });
+                }
                 send(chunkFrame(base, {}, completion.finishReason || "stop", completion.usage ? { ...completion.usage } : undefined));
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                 controller.close();
@@ -377,6 +423,13 @@ function sseResponse(completion, echoModel) {
     });
 }
 function jsonCompletionResponse(completion, echoModel) {
+    // PATCH: surface tool_calls so the agent can actually execute them.
+    const message = {
+        role: "assistant",
+        content: completion.toolCalls && completion.content === "" ? null : completion.content,
+    };
+    if (completion.toolCalls)
+        message.tool_calls = completion.toolCalls;
     const payload = {
         id: completion.id,
         object: "chat.completion",
@@ -385,7 +438,7 @@ function jsonCompletionResponse(completion, echoModel) {
         choices: [
             {
                 index: 0,
-                message: { role: "assistant", content: completion.content },
+                message,
                 finish_reason: completion.finishReason || "stop",
             },
         ],
@@ -599,7 +652,7 @@ export const CloudbaseBridge = async (input = {}, options = {}) => {
                     {
                         name: spec.name,
                         limit: { context: spec.context, output: spec.output },
-                        tool_call: false,
+                        tool_call: true,
                         ...(spec.verified ? {} : { disabled: true }),
                     },
                 ])),
@@ -689,7 +742,7 @@ export const CloudbaseBridge = async (input = {}, options = {}) => {
                             : {
                                 name: known?.name ?? id,
                                 limit: { context: known?.context ?? 131_072, output: known?.output ?? 16_384 },
-                                tool_call: false,
+                                tool_call: true,
                             };
                         // The deployed function's allowlist explicitly accepts this id
                         // (it just said so in the ping), so a static placeholder
