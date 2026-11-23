@@ -34,7 +34,7 @@
  * Version & constants (single source of truth; no imports allowed —  *
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
-export const PLUGIN_VERSION = "0.2.4-tools.1";
+export const PLUGIN_VERSION = "0.2.4-tools.3";
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
 const PROVIDER_ID = "cloudbase";
@@ -53,7 +53,16 @@ const MODEL_CATALOG = {
     "hy3": { name: "Hunyuan 3", context: 262_144, output: 16_384, verified: true },
     "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 1_000_000, output: 16_384, verified: true },
     "deepseek-v4.1-flash-1017": { name: "DeepSeek V4.1 Flash 1017", context: 1_000_000, output: 16_384, verified: true },
+    // PATCH (tools.2): text-to-image model from the growth-plan image pack.
+    // Selecting it turns the chat request into an aiProxy image call.
+    "HY-Image-3.0-Plus-4090-Tob-v1.0": { name: "Hunyuan Image 3.0 Plus （生图）", context: 8_192, output: 1_024, verified: true },
+    // PATCH (tools.3): aiProxy auto modes. The function resolves them:
+    // image intent -> image model; everything else -> the named chat model
+    // ("auto" defaults to DeepSeek V4.1 Flash 1017, "auto-hy4" uses Hunyuan 4).
+    "auto": { name: "CloudBase Auto（代码/工具 DeepSeek · 生图自动切换）", context: 1_000_000, output: 16_384, verified: true },
+    "auto-hy4": { name: "CloudBase Auto · 混元4（聊天/长文 · 生图自动切换）", context: 1_000_000, output: 16_384, verified: true },
 };
+const IMAGE_MODEL_ID = "HY-Image-3.0-Plus-4090-Tob-v1.0";
 /* ------------------------------------------------------------------ *
  * Small utilities.                                                   *
  * ------------------------------------------------------------------ */
@@ -293,6 +302,58 @@ function buildInvokeEvent(body, model) {
     }
     return event;
 }
+/** PATCH (tools.2): last user message's text, used as the image prompt. */
+function lastUserText(messages) {
+    if (!Array.isArray(messages))
+        return "";
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (!isPlainObject(m) || m.role !== "user")
+            continue;
+        if (typeof m.content === "string" && m.content.trim())
+            return m.content;
+        if (Array.isArray(m.content)) {
+            const t = m.content
+                .filter((p) => isPlainObject(p) && p.type === "text" && typeof p.text === "string")
+                .map((p) => p.text)
+                .join("\n")
+                .trim();
+            if (t)
+                return t;
+        }
+    }
+    return "";
+}
+/** PATCH (tools.2): build an aiProxy image invocation from a chat body. */
+function buildImageEvent(body) {
+    const event = { action: "image", model: IMAGE_MODEL_ID, prompt: lastUserText(body.messages) };
+    const size = body.size;
+    if (typeof size === "string" && /^\d{3,4}x\d{3,4}$/.test(size))
+        event.size = size;
+    return event;
+}
+/** PATCH (tools.2): shape an aiProxy image reply into a chat completion. */
+function normalizeImageCompletion(value) {
+    if (!isPlainObject(value) || !Array.isArray(value.data) || value.data.length === 0)
+        return null;
+    const first = value.data[0];
+    if (!isPlainObject(first) || typeof first.url !== "string" || !first.url)
+        return null;
+    const url = first.url;
+    let content = `![生成的图片](${url})\n\n[打开原图](${url})`;
+    if (typeof first.revised_prompt === "string" && first.revised_prompt) {
+        content += `\n\n（实际提示词：${first.revised_prompt}）`;
+    }
+    return {
+        id: `chatcmpl-${Date.now().toString(36)}`,
+        created: Math.floor(Date.now() / 1000),
+        model: IMAGE_MODEL_ID,
+        content,
+        toolCalls: null,
+        finishReason: "stop",
+        usage: null,
+    };
+}
 /**
  * Validate the aiProxy reply (an OpenAI Chat Completions object) well enough
  * to adapt it. Returns null when the shape is unusable.
@@ -522,7 +583,8 @@ async function bridgeFetch(input, init) {
         return errorResponse(404, `Model "${truncate(model, 64)}" is not in the CloudBase Bridge catalog. Known models: ${known}.`, { code: "MODEL_NOT_ALLOWED" });
     }
     const stream = body.stream === true;
-    const event = buildInvokeEvent(body, model);
+    // PATCH (tools.2): the image model turns the chat into an image call.
+    const event = model === IMAGE_MODEL_ID ? buildImageEvent(body) : buildInvokeEvent(body, model);
     const payload = JSON.stringify(event);
     // Measure real UTF-8 bytes: string .length counts UTF-16 code units and
     // under-reports CJK content (each CJK char is typically 3 bytes but 1-2 units).
@@ -584,7 +646,7 @@ async function bridgeFetch(input, init) {
         log("warn", `aiProxy error envelope: ${typeof functionResult.error.code === "string" ? functionResult.error.code : "unknown"}`);
         return mapped;
     }
-    const completion = normalizeCompletion(functionResult);
+    const completion = model === IMAGE_MODEL_ID ? normalizeImageCompletion(functionResult) : normalizeCompletion(functionResult);
     if (!completion) {
         log("error", "aiProxy reply is not a Chat Completions object");
         return errorResponse(502, "aiProxy reply is missing `choices[0].message`. Make sure the deployed aiProxy matches this plugin version (see docs/deploy-aiproxy.md).", { code: "INVALID_FUNCTION_RESPONSE" });
