@@ -34,13 +34,13 @@
  * Version & constants (single source of truth; no imports allowed —  *
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
-export const PLUGIN_VERSION = "0.2.4-tools.8";
+export const PLUGIN_VERSION = "0.2.4-tools.9";
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
 const PROVIDER_ID = "cloudbase";
 const PROVIDER_ID_FALLBACK_PREFIX = "cloudbase-plugin/";
 const DEFAULT_FUNCTION_NAME = "aiProxy";
-const DEFAULT_TIMEOUT_MS = 150_000; // gateway invoke waits for the function; keep above the recommended 120 s function timeout
+const DEFAULT_TIMEOUT_MS = 900_000; // PATCH (tools.9): match the aiProxy function timeout (900 s). The old 150 s default killed long generations (e.g. writing a whole HTML file with hy4) on the client side while the function would happily run for 900 s.
 const DEFAULT_MAX_EVENT_BYTES = 8 * 1024 * 1024;
 const SSE_CHUNK_CHARS = 200;
 const USER_AGENT = `opencode-cloudbase-bridge/${PLUGIN_VERSION}`;
@@ -697,7 +697,7 @@ function resolveAccountConfig(auth, options, inputMagpieOptions) {
     const regionRaw = readMetadataString(metadata, "region") ?? readMetadataString(mergedOptions, "region");
     const region = regionRaw === "intl" ? "intl" : "cn";
     const timeoutRaw = mergedOptions.timeoutMs;
-    const timeoutMs = typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) && timeoutRaw >= 250 && timeoutRaw <= 600_000
+    const timeoutMs = typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) && timeoutRaw >= 250 && timeoutRaw <= 900_000
         ? timeoutRaw
         : DEFAULT_TIMEOUT_MS;
     const gatewayBaseRaw = readMetadataString(mergedOptions, "gatewayBaseUrl");
