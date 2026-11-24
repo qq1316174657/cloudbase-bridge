@@ -34,7 +34,7 @@
  * Version & constants (single source of truth; no imports allowed —  *
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
-export const PLUGIN_VERSION = "0.2.4-tools.4";
+export const PLUGIN_VERSION = "0.2.4-tools.5";
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
 const PROVIDER_ID = "cloudbase";
@@ -402,6 +402,7 @@ function normalizeImageCompletion(value) {
         created: Math.floor(Date.now() / 1000),
         model: IMAGE_MODEL_ID,
         content,
+        reasoning: null,
         toolCalls: null,
         finishReason: "stop",
         usage: null,
@@ -422,6 +423,10 @@ function normalizeCompletion(value) {
         return null;
     const message = isPlainObject(first.message) ? first.message : null;
     const content = message && typeof message.content === "string" ? message.content : "";
+    // PATCH (tools.5): keep reasoning_content so clients can show thinking time.
+    const reasoning = message && typeof message.reasoning_content === "string" && message.reasoning_content
+        ? message.reasoning_content
+        : null;
     // PATCH: keep structured tool_calls instead of dropping them.
     const toolCalls = message && Array.isArray(message.tool_calls) && message.tool_calls.length > 0
         ? message.tool_calls.filter(isPlainObject)
@@ -439,6 +444,7 @@ function normalizeCompletion(value) {
         created: typeof value.created === "number" ? value.created : Math.floor(Date.now() / 1000),
         model: typeof value.model === "string" ? value.model : "",
         content,
+        reasoning,
         toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : null,
         finishReason,
         usage,
@@ -478,6 +484,13 @@ function sseResponse(completion, echoModel) {
             };
             try {
                 send(chunkFrame(base, { role: "assistant", content: "" }, null));
+                // PATCH (tools.5): stream reasoning first so clients render the
+                // thinking block (and its elapsed time) before the answer.
+                if (completion.reasoning) {
+                    for (const piece of chunkText(completion.reasoning, SSE_CHUNK_CHARS)) {
+                        send(chunkFrame(base, { reasoning_content: piece }, null));
+                    }
+                }
                 for (const piece of chunkText(completion.content, SSE_CHUNK_CHARS)) {
                     send(chunkFrame(base, { content: piece }, null));
                 }
@@ -544,6 +557,8 @@ function jsonCompletionResponse(completion, echoModel) {
     };
     if (completion.toolCalls)
         message.tool_calls = completion.toolCalls;
+    if (completion.reasoning)
+        message.reasoning_content = completion.reasoning;
     const payload = {
         id: completion.id,
         object: "chat.completion",
