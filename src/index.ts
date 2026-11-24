@@ -36,7 +36,7 @@
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
 
-export const PLUGIN_VERSION = "0.2.4-tools.5" as const;
+export const PLUGIN_VERSION = "0.2.4-tools.6" as const;
 
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
@@ -1033,6 +1033,10 @@ export const CloudbaseBridge = async (
               name: spec.name,
               limit: { context: spec.context, output: spec.output },
               tool_call: true,
+              // PATCH (tools.6): declare reasoning support, otherwise the
+              // client never renders the thinking block / thinking time
+              // even when reasoning_content deltas are streamed.
+              reasoning: true,
               ...(spec.verified ? {} : { disabled: true }),
             },
           ]),
@@ -1122,6 +1126,7 @@ export const CloudbaseBridge = async (
                   name: known?.name ?? id,
                   limit: { context: known?.context ?? 131_072, output: known?.output ?? 16_384 },
                   tool_call: true,
+                  reasoning: true, // PATCH (tools.6): see config hook.
                 };
             // The deployed function's allowlist explicitly accepts this id
             // (it just said so in the ping), so a static placeholder
