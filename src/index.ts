@@ -36,7 +36,7 @@
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
 
-export const PLUGIN_VERSION = "0.2.4-tools.6" as const;
+export const PLUGIN_VERSION = "0.2.4-tools.7" as const;
 
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
@@ -636,6 +636,78 @@ function chunkFrame(base: { id: string; created: number; model: string }, delta:
  * (split on code-point boundaries), a final chunk carrying finish_reason and
  * usage, then the `data: [DONE]` sentinel.
  */
+/**
+ * PATCH (tools.7): shared frame emitter for a normalized completion.
+ * Frame order: optional role frame, reasoning chunks (optional), content
+ * chunks, tool_call frames, final finish/usage frame.
+ */
+function emitCompletion(
+  send: (frame: Json) => void,
+  base: { id: string; created: number; model: string },
+  completion: NormalizedCompletion,
+  opts: { roleFrame: boolean; reasoning: boolean },
+): void {
+  if (opts.roleFrame) {
+    send(chunkFrame(base, { role: "assistant", content: "" }, null));
+  }
+  if (opts.reasoning && completion.reasoning) {
+    for (const piece of chunkText(completion.reasoning, SSE_CHUNK_CHARS)) {
+      send(chunkFrame(base, { reasoning_content: piece }, null));
+    }
+  }
+  for (const piece of chunkText(completion.content, SSE_CHUNK_CHARS)) {
+    send(chunkFrame(base, { content: piece }, null));
+  }
+  if (completion.toolCalls) {
+    completion.toolCalls.forEach((call, i) => {
+      const fn = isPlainObject(call.function) ? call.function : {};
+      send(
+        chunkFrame(
+          base,
+          {
+            tool_calls: [
+              {
+                index: i,
+                id: typeof call.id === "string" ? call.id : `call_${i}`,
+                type: "function",
+                function: {
+                  name: typeof fn.name === "string" ? fn.name : "",
+                  arguments: "",
+                },
+              },
+            ],
+          },
+          null,
+        ),
+      );
+      send(
+        chunkFrame(
+          base,
+          {
+            tool_calls: [
+              {
+                index: i,
+                function: {
+                  arguments: typeof fn.arguments === "string" ? fn.arguments : "",
+                },
+              },
+            ],
+          },
+          null,
+        ),
+      );
+    });
+  }
+  send(
+    chunkFrame(
+      base,
+      {},
+      completion.finishReason || "stop",
+      completion.usage ? { ...completion.usage } : undefined,
+    ),
+  );
+}
+
 function sseResponse(completion: NormalizedCompletion, echoModel: string): Response {
   const base = { id: completion.id, created: completion.created, model: echoModel };
   const encoder = new TextEncoder();
@@ -645,67 +717,7 @@ function sseResponse(completion: NormalizedCompletion, echoModel: string): Respo
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
       };
       try {
-        send(chunkFrame(base, { role: "assistant", content: "" }, null));
-        // PATCH (tools.5): stream reasoning first so clients render the
-        // thinking block (and its elapsed time) before the answer.
-        if (completion.reasoning) {
-          for (const piece of chunkText(completion.reasoning, SSE_CHUNK_CHARS)) {
-            send(chunkFrame(base, { reasoning_content: piece }, null));
-          }
-        }
-        for (const piece of chunkText(completion.content, SSE_CHUNK_CHARS)) {
-          send(chunkFrame(base, { content: piece }, null));
-        }
-        // PATCH: stream tool_calls as OpenAI-style deltas (one header frame
-        // with id/name, one frame carrying the full arguments string).
-        if (completion.toolCalls) {
-          completion.toolCalls.forEach((call, i) => {
-            const fn = isPlainObject(call.function) ? call.function : {};
-            send(
-              chunkFrame(
-                base,
-                {
-                  tool_calls: [
-                    {
-                      index: i,
-                      id: typeof call.id === "string" ? call.id : `call_${i}`,
-                      type: "function",
-                      function: {
-                        name: typeof fn.name === "string" ? fn.name : "",
-                        arguments: "",
-                      },
-                    },
-                  ],
-                },
-                null,
-              ),
-            );
-            send(
-              chunkFrame(
-                base,
-                {
-                  tool_calls: [
-                    {
-                      index: i,
-                      function: {
-                        arguments: typeof fn.arguments === "string" ? fn.arguments : "",
-                      },
-                    },
-                  ],
-                },
-                null,
-              ),
-            );
-          });
-        }
-        send(
-          chunkFrame(
-            base,
-            {},
-            completion.finishReason || "stop",
-            completion.usage ? { ...completion.usage } : undefined,
-          ),
-        );
+        emitCompletion(send, base, completion, { roleFrame: true, reasoning: true });
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       } catch (error) {
@@ -717,6 +729,78 @@ function sseResponse(completion: NormalizedCompletion, echoModel: string): Respo
         }
         void error;
       }
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache",
+      "x-accel-buffering": "no",
+    },
+  });
+}
+
+/**
+ * PATCH (tools.7): early-streaming response. The one-shot version above can
+ * only start streaming AFTER the function returns, so a client that times
+ * the reasoning phase from the first reasoning delta measures ~0.1 s no
+ * matter how long the function actually thought (seen live in aicode:
+ * "思考完成（耗时 0.1 秒）" for a half-minute image round). This variant
+ * opens the stream immediately, emits the role frame and a first reasoning
+ * delta right away, and only then awaits the function; the completion
+ * frames follow when it returns, so the client's measured thinking time
+ * tracks the real wait.
+ */
+function earlySseResponse(
+  echoModel: string,
+  produce: () => Promise<NormalizedCompletion>,
+): Response {
+  const encoder = new TextEncoder();
+  const streamId = `chatcmpl-${Date.now().toString(36)}`;
+  const created = Math.floor(Date.now() / 1000);
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const base = { id: streamId, created, model: echoModel };
+      const send = (frame: Json) => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+      };
+      try {
+        send(chunkFrame(base, { role: "assistant", content: "" }, null));
+        send(chunkFrame(base, { reasoning_content: "思考中…" }, null));
+      } catch {
+        /* consumer went away before we even started */
+      }
+      produce().then(
+        (completion) => {
+          try {
+            emitCompletion(send, base, completion, { roleFrame: false, reasoning: true });
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          } catch {
+            try {
+              controller.close();
+            } catch {
+              /* already closed */
+            }
+          }
+        },
+        (error) => {
+          try {
+            const msg = error instanceof Error ? error.message : "unknown error";
+            send(chunkFrame(base, { content: `（请求失败：${msg}）` }, null));
+            send(chunkFrame(base, {}, "stop"));
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          } catch {
+            try {
+              controller.close();
+            } catch {
+              /* already closed */
+            }
+          }
+        },
+      );
     },
   });
   return new Response(stream, {
@@ -868,6 +952,11 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
 
   log("debug", `invoke ${cfg.functionName} model=${model} stream=${stream} bytes=${payloadBytes}`);
 
+  // PATCH (tools.7): the invoke runs inside a closure so streaming
+  // requests can open the SSE stream first (earlySseResponse) and run
+  // it in the background; error paths keep returning plain Responses,
+  // which the streaming caller converts into an in-stream error line.
+  const runInvoke = async (): Promise<NormalizedCompletion | Response> => {
   const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs);
   const signal = combineSignals(init?.signal, timeoutSignal);
 
@@ -943,6 +1032,45 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
     );
   }
 
+    return completion;
+  };
+
+  // PATCH (tools.7): streaming requests open the SSE stream immediately so
+  // the client's thinking timer measures the real function wait. An
+  // already-aborted request must still reject like native fetch (the
+  // in-stream error fallback must not swallow that contract).
+  if (stream && init?.signal?.aborted) {
+    throw (init.signal as AbortSignal).reason ?? new Error("The operation was aborted");
+  }
+  if (stream) {
+    return earlySseResponse(rawModel, async () => {
+      const outcome = await runInvoke();
+      if (outcome instanceof Response) {
+        let msg = `HTTP ${outcome.status}`;
+        try {
+          const parsedErr: unknown = JSON.parse(await outcome.text());
+          if (isPlainObject(parsedErr) && isPlainObject(parsedErr.error) && typeof parsedErr.error.message === "string") {
+            msg = parsedErr.error.message;
+          }
+        } catch {
+          /* keep the status-based message */
+        }
+        throw new Error(msg);
+      }
+      const durationMs = Date.now() - startedAt;
+      const totalTokens = outcome.usage?.total_tokens;
+      log(
+        "info",
+        `invoke ok model=${model} stream=${stream} ${durationMs} ms tokens=${typeof totalTokens === "number" ? totalTokens : "n/a"}`,
+      );
+      return outcome;
+    });
+  }
+
+  const outcome = await runInvoke();
+  if (outcome instanceof Response) return outcome;
+  const completion = outcome;
+
   const durationMs = Date.now() - startedAt;
   const totalTokens = completion.usage?.total_tokens;
   log(
@@ -952,7 +1080,7 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
 
   // Echo the model id exactly as the agent requested it (prefix included)
   // so clients keep seeing the identity they asked for.
-  return stream ? sseResponse(completion, rawModel) : jsonCompletionResponse(completion, rawModel);
+  return jsonCompletionResponse(completion, rawModel);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1172,6 +1300,7 @@ export const _internal = {
   normalizeCompletion,
   chunkText,
   sseResponse,
+  earlySseResponse,
   jsonCompletionResponse,
   errorResponse,
   mapGatewayError,
