@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [SemVer](https://semver.org/).
 
+## [0.2.4-tools.9] - 2026-11-24 (local fork patch)
+
+- Raise the function-invoke timeout: default 150 s -> 900 s (matching the
+  aiProxy cloud function's own 900 s limit), and the accepted
+  `options.timeoutMs` range now tops out at 900_000. The 150 s default
+  aborted long generations client-side (seen live: "CloudBase function
+  invocation timed out after 150 s" while auto-hy4 was writing a complete
+  HTML file) even though the function itself would have kept going.
+
 ## [0.2.4-tools.8] - 2026-11-24 (local fork patch)
 
 - For auto models, drop the client's native `generateImage` tool from the
