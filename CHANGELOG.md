@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [SemVer](https://semver.org/).
 
+## [0.2.4-tools.8] - 2026-11-24 (local fork patch)
+
+- For auto models, drop the client's native `generateImage` tool from the
+  forwarded tool list. aicode's native image tool expects an images-API
+  reply; this chain answers with a chat completion, so the tool failed
+  with "drew nothing" (image URL truncated) and the model retried it in a
+  loop, even improvising calls to third-party image sites. In auto mode
+  the aiProxy state machine and its server-side `generate_image` tool
+  cover image generation end-to-end. Other models are unaffected.
+
 ## [0.2.4-tools.7] - 2026-11-24 (local fork patch)
 
 - Stream early: for streaming requests the SSE response now opens
