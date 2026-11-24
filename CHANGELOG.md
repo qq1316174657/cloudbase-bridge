@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [SemVer](https://semver.org/).
 
+## [0.2.4-tools.7] - 2026-11-24 (local fork patch)
+
+- Stream early: for streaming requests the SSE response now opens
+  immediately (role frame + first reasoning delta) and the function is
+  invoked while the stream is held open, instead of synthesizing the whole
+  stream after the function returns. Clients that time the thinking phase
+  from the first reasoning delta previously measured ~0.1 s regardless of
+  the real wait; now the measured thinking time tracks the actual
+  function duration. Non-streaming requests are unchanged.
+
 ## [0.2.4-tools.6] - 2026-11-24 (local fork patch)
 
 - Declare `reasoning: true` on every catalog model (config hook and the
