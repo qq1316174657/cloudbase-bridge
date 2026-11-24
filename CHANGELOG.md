@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [SemVer](https://semver.org/).
 
+## [0.2.4-tools.6] - 2026-11-24 (local fork patch)
+
+- Declare `reasoning: true` on every catalog model (config hook and the
+  ping-refreshed dynamic list). tools.5 streamed reasoning_content but the
+  client did not render a thinking block: without the capability flag the
+  opencode-family client does not expect reasoning from this provider.
+
 ## [0.2.4-tools.5] - 2026-11-24 (local fork patch)
 
 - Forward `reasoning_content` from aiProxy v2.2.7+: normalizeCompletion keeps
