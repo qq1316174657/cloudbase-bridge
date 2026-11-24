@@ -4,6 +4,13 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/) and the project uses
 [SemVer](https://semver.org/).
 
+## [0.2.4-tools.5] - 2026-11-24 (local fork patch)
+
+- Forward `reasoning_content` from aiProxy v2.2.7+: normalizeCompletion keeps
+  it, the JSON response carries it, and the synthesized SSE stream emits
+  reasoning deltas before content deltas, so clients can render the thinking
+  block and its elapsed time.
+
 ## [0.2.4] - 2026-11-23
 
 - Model refresh (2026-11-23, from my environment's current list): add
