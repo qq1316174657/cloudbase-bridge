@@ -36,7 +36,7 @@
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
 
-export const PLUGIN_VERSION = "0.2.4" as const;
+export const PLUGIN_VERSION = "0.2.4-tools.5" as const;
 
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
@@ -45,7 +45,7 @@ const PROVIDER_ID_FALLBACK_PREFIX = "cloudbase-plugin/";
 
 const DEFAULT_FUNCTION_NAME = "aiProxy";
 const DEFAULT_TIMEOUT_MS = 150_000; // gateway invoke waits for the function; keep above the recommended 120 s function timeout
-const DEFAULT_MAX_EVENT_BYTES = 512 * 1024;
+const DEFAULT_MAX_EVENT_BYTES = 8 * 1024 * 1024;
 const SSE_CHUNK_CHARS = 200;
 const USER_AGENT = `opencode-cloudbase-bridge/${PLUGIN_VERSION}`;
 
@@ -87,7 +87,17 @@ const MODEL_CATALOG: Readonly<Record<string, ModelSpec>> = {
   "hy3": { name: "Hunyuan 3", context: 262_144, output: 16_384, verified: true },
   "deepseek-v4.1-flash": { name: "DeepSeek V4.1 Flash", context: 1_000_000, output: 16_384, verified: true },
   "deepseek-v4.1-flash-1017": { name: "DeepSeek V4.1 Flash 1017", context: 1_000_000, output: 16_384, verified: true },
+  // PATCH (tools.2): text-to-image model from the growth-plan image pack.
+  // Selecting it turns the chat request into an aiProxy image call.
+  "HY-Image-3.0-Plus-4090-Tob-v1.0": { name: "Hunyuan Image 3.0 Plus （生图）", context: 8_192, output: 1_024, verified: true },
+  // PATCH (tools.3): aiProxy auto modes. The function resolves them:
+  // image intent -> image model; everything else -> the named chat model
+  // ("auto" defaults to DeepSeek V4.1 Flash 1017, "auto-hy4" uses Hunyuan 4).
+  "auto": { name: "CloudBase Auto（代码/工具 DeepSeek · 生图自动切换）", context: 1_000_000, output: 16_384, verified: true },
+  "auto-hy4": { name: "CloudBase Auto · 混元4（聊天/长文 · 生图自动切换）", context: 1_000_000, output: 16_384, verified: true },
 };
+
+const IMAGE_MODEL_ID = "HY-Image-3.0-Plus-4090-Tob-v1.0";
 
 /* ------------------------------------------------------------------ *
  * Minimal structural types (no runtime dependencies).                *
@@ -142,6 +152,9 @@ interface ChatCompletionsBody {
   stream?: unknown;
   temperature?: unknown;
   top_p?: unknown;
+  max_tokens?: unknown;
+  tools?: unknown;
+  tool_choice?: unknown;
 }
 
 /* ------------------------------------------------------------------ *
@@ -427,18 +440,123 @@ function mapFunctionError(
  * Chat Completions <-> aiProxy adapters.                             *
  * ------------------------------------------------------------------ */
 
+/**
+ * PATCH (tools.4): shrink bloated history before invoking the function.
+ * Long aicode threads accumulate base64 images (viewImage results, user
+ * uploads) and huge tool outputs, and every request re-sends all of it
+ * until the payload cap kills the turn (413, seen live at 4.68 MB).
+ * In older messages, image data and oversized contents are replaced by
+ * short placeholders; roles, structure and tool_call ids are preserved
+ * so tool pairing stays valid. The most recent messages pass untouched.
+ */
+const KEEP_RECENT_MESSAGES = 8;
+const OLD_CONTENT_LIMIT = 4000;
+const HUGE_PART_BYTES = 200_000;
+
+function shrinkOldText(s: string): string {
+  if (s.startsWith("data:image/") || s.length > HUGE_PART_BYTES) return "[图片数据已省略]";
+  if (s.length > OLD_CONTENT_LIMIT) return s.slice(0, OLD_CONTENT_LIMIT) + "\n[内容过长已截断]";
+  return s;
+}
+
+function shrinkOldMessage(m: unknown): unknown {
+  if (!isPlainObject(m)) return m;
+  const out: Json = { ...m };
+  const c = m.content;
+  if (typeof c === "string") {
+    out.content = shrinkOldText(c);
+  } else if (Array.isArray(c)) {
+    out.content = c.map((p) => {
+      if (!isPlainObject(p)) return p;
+      if (p.type === "image_url" || p.type === "image") return { type: "text", text: "[图片已省略]" };
+      if (p.type === "text" && typeof p.text === "string") return { ...p, text: shrinkOldText(p.text) };
+      let serialized = "";
+      try { serialized = JSON.stringify(p); } catch { /* keep part as-is */ }
+      if (serialized.length > HUGE_PART_BYTES) return { type: "text", text: "[内容已省略]" };
+      return p;
+    });
+  }
+  return out;
+}
+
+function sanitizeMessages(messages: unknown): unknown {
+  if (!Array.isArray(messages) || messages.length <= KEEP_RECENT_MESSAGES) return messages;
+  const cutoff = messages.length - KEEP_RECENT_MESSAGES;
+  return messages.map((m, i) => (i < cutoff ? shrinkOldMessage(m) : m));
+}
+
 function buildInvokeEvent(body: ChatCompletionsBody, model: string): Json {
-  const event: Json = { action: "chat", model, messages: body.messages };
+  const event: Json = { action: "chat", model, messages: sanitizeMessages(body.messages) };
   if (typeof body.temperature === "number" && Number.isFinite(body.temperature)) {
     event.temperature = body.temperature;
   }
   if (typeof body.top_p === "number" && Number.isFinite(body.top_p)) {
     event.topP = body.top_p;
   }
-  // NOTE: `max_tokens` and `tools` are intentionally not forwarded: the
-  // documented @cloudbase/node-sdk generateText input carries
-  // { model, messages, temperature?, topP? } only (see README limitations).
+  // PATCH (local fork): forward `max_tokens`, `tools` and `tool_choice`.
+  // The stock plugin intentionally dropped them because the original
+  // aiProxy (v1) only did plain generateText. The deployed aiProxy v2+
+  // accepts tools (it registers them with the CloudBase SDK and returns
+  // OpenAI-style tool_calls) and honours max_tokens, so pass them through.
+  if (typeof body.max_tokens === "number" && Number.isFinite(body.max_tokens)) {
+    event.max_tokens = body.max_tokens;
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    event.tools = body.tools;
+  }
+  if (typeof body.tool_choice !== "undefined") {
+    event.tool_choice = body.tool_choice;
+  }
   return event;
+}
+
+/** PATCH (tools.2): last user message's text, used as the image prompt. */
+function lastUserText(messages: unknown): string {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i] as Json;
+    if (!isPlainObject(m) || m.role !== "user") continue;
+    if (typeof m.content === "string" && m.content.trim()) return m.content;
+    if (Array.isArray(m.content)) {
+      const t = m.content
+        .filter((p): p is Json => isPlainObject(p) && p.type === "text" && typeof p.text === "string")
+        .map((p) => p.text as string)
+        .join("\n")
+        .trim();
+      if (t) return t;
+    }
+  }
+  return "";
+}
+
+/** PATCH (tools.2): build an aiProxy image invocation from a chat body. */
+function buildImageEvent(body: ChatCompletionsBody): Json {
+  const event: Json = { action: "image", model: IMAGE_MODEL_ID, prompt: lastUserText(body.messages) };
+  const size = (body as unknown as Json).size;
+  if (typeof size === "string" && /^\d{3,4}x\d{3,4}$/.test(size)) event.size = size;
+  return event;
+}
+
+/** PATCH (tools.2): shape an aiProxy image reply into a chat completion. */
+function normalizeImageCompletion(value: unknown): NormalizedCompletion | null {
+  if (!isPlainObject(value) || !Array.isArray(value.data) || value.data.length === 0) return null;
+  const first = value.data[0];
+  if (!isPlainObject(first) || typeof first.url !== "string" || !first.url) return null;
+  const url = first.url;
+  let content = `![生成的图片](${url})\n\n[打开原图](${url})`;
+  if (typeof first.revised_prompt === "string" && first.revised_prompt) {
+    content += `\n\n（实际提示词：${first.revised_prompt}）`;
+  }
+  return {
+    id: `chatcmpl-${Date.now().toString(36)}`,
+    created: Math.floor(Date.now() / 1000),
+    model: IMAGE_MODEL_ID,
+    content,
+    reasoning: null,
+    toolCalls: null,
+    finishReason: "stop",
+    usage: null,
+  };
 }
 
 interface NormalizedCompletion {
@@ -446,6 +564,8 @@ interface NormalizedCompletion {
   created: number;
   model: string; // canonical model id used upstream
   content: string;
+  reasoning: string | null; // PATCH (tools.5): reasoning_content from aiProxy v2.2.7+
+  toolCalls: Json[] | null; // PATCH: OpenAI-style tool_calls from aiProxy v2+
   finishReason: string;
   usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
 }
@@ -462,6 +582,16 @@ function normalizeCompletion(value: unknown): NormalizedCompletion | null {
   if (!isPlainObject(first)) return null;
   const message = isPlainObject(first.message) ? first.message : null;
   const content = message && typeof message.content === "string" ? message.content : "";
+  // PATCH (tools.5): keep reasoning_content so clients can show thinking time.
+  const reasoning =
+    message && typeof message.reasoning_content === "string" && message.reasoning_content
+      ? message.reasoning_content
+      : null;
+  // PATCH: keep structured tool_calls instead of dropping them.
+  const toolCalls =
+    message && Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+      ? (message.tool_calls.filter(isPlainObject) as Json[])
+      : null;
   const finishReason = typeof first.finish_reason === "string" ? first.finish_reason : "stop";
   const usage = isPlainObject(value.usage)
     ? {
@@ -475,6 +605,8 @@ function normalizeCompletion(value: unknown): NormalizedCompletion | null {
     created: typeof value.created === "number" ? value.created : Math.floor(Date.now() / 1000),
     model: typeof value.model === "string" ? value.model : "",
     content,
+    reasoning,
+    toolCalls: toolCalls && toolCalls.length > 0 ? toolCalls : null,
     finishReason,
     usage,
   };
@@ -514,8 +646,57 @@ function sseResponse(completion: NormalizedCompletion, echoModel: string): Respo
       };
       try {
         send(chunkFrame(base, { role: "assistant", content: "" }, null));
+        // PATCH (tools.5): stream reasoning first so clients render the
+        // thinking block (and its elapsed time) before the answer.
+        if (completion.reasoning) {
+          for (const piece of chunkText(completion.reasoning, SSE_CHUNK_CHARS)) {
+            send(chunkFrame(base, { reasoning_content: piece }, null));
+          }
+        }
         for (const piece of chunkText(completion.content, SSE_CHUNK_CHARS)) {
           send(chunkFrame(base, { content: piece }, null));
+        }
+        // PATCH: stream tool_calls as OpenAI-style deltas (one header frame
+        // with id/name, one frame carrying the full arguments string).
+        if (completion.toolCalls) {
+          completion.toolCalls.forEach((call, i) => {
+            const fn = isPlainObject(call.function) ? call.function : {};
+            send(
+              chunkFrame(
+                base,
+                {
+                  tool_calls: [
+                    {
+                      index: i,
+                      id: typeof call.id === "string" ? call.id : `call_${i}`,
+                      type: "function",
+                      function: {
+                        name: typeof fn.name === "string" ? fn.name : "",
+                        arguments: "",
+                      },
+                    },
+                  ],
+                },
+                null,
+              ),
+            );
+            send(
+              chunkFrame(
+                base,
+                {
+                  tool_calls: [
+                    {
+                      index: i,
+                      function: {
+                        arguments: typeof fn.arguments === "string" ? fn.arguments : "",
+                      },
+                    },
+                  ],
+                },
+                null,
+              ),
+            );
+          });
         }
         send(
           chunkFrame(
@@ -549,6 +730,13 @@ function sseResponse(completion: NormalizedCompletion, echoModel: string): Respo
 }
 
 function jsonCompletionResponse(completion: NormalizedCompletion, echoModel: string): Response {
+  // PATCH: surface tool_calls so the agent can actually execute them.
+  const message: Json = {
+    role: "assistant",
+    content: completion.toolCalls && completion.content === "" ? null : completion.content,
+  };
+  if (completion.toolCalls) message.tool_calls = completion.toolCalls;
+  if (completion.reasoning) message.reasoning_content = completion.reasoning;
   const payload: Json = {
     id: completion.id,
     object: "chat.completion",
@@ -557,7 +745,7 @@ function jsonCompletionResponse(completion: NormalizedCompletion, echoModel: str
     choices: [
       {
         index: 0,
-        message: { role: "assistant", content: completion.content },
+        message,
         finish_reason: completion.finishReason || "stop",
       },
     ],
@@ -664,7 +852,8 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
   }
 
   const stream = body.stream === true;
-  const event = buildInvokeEvent(body, model);
+  // PATCH (tools.2): the image model turns the chat into an image call.
+  const event = model === IMAGE_MODEL_ID ? buildImageEvent(body) : buildInvokeEvent(body, model);
   const payload = JSON.stringify(event);
   // Measure real UTF-8 bytes: string .length counts UTF-16 code units and
   // under-reports CJK content (each CJK char is typically 3 bytes but 1-2 units).
@@ -743,7 +932,8 @@ async function bridgeFetch(this: BridgeContext, input: unknown, init?: { method?
     return mapped;
   }
 
-  const completion = normalizeCompletion(functionResult);
+  const completion =
+    model === IMAGE_MODEL_ID ? normalizeImageCompletion(functionResult) : normalizeCompletion(functionResult);
   if (!completion) {
     log("error", "aiProxy reply is not a Chat Completions object");
     return errorResponse(
@@ -842,7 +1032,7 @@ export const CloudbaseBridge = async (
             {
               name: spec.name,
               limit: { context: spec.context, output: spec.output },
-              tool_call: false,
+              tool_call: true,
               ...(spec.verified ? {} : { disabled: true }),
             },
           ]),
@@ -931,7 +1121,7 @@ export const CloudbaseBridge = async (
               : {
                   name: known?.name ?? id,
                   limit: { context: known?.context ?? 131_072, output: known?.output ?? 16_384 },
-                  tool_call: false,
+                  tool_call: true,
                 };
             // The deployed function's allowlist explicitly accepts this id
             // (it just said so in the ping), so a static placeholder
@@ -973,6 +1163,7 @@ export const _internal = {
   normalizeModel,
   resolveAccountConfig,
   buildInvokeEvent,
+  sanitizeMessages,
   normalizeCompletion,
   chunkText,
   sseResponse,
