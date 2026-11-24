@@ -34,7 +34,7 @@
  * Version & constants (single source of truth; no imports allowed —  *
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
-export const PLUGIN_VERSION = "0.2.4-tools.6";
+export const PLUGIN_VERSION = "0.2.4-tools.7";
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
 const PROVIDER_ID = "cloudbase";
@@ -474,6 +474,53 @@ function chunkFrame(base, delta, finishReason, usage) {
  * (split on code-point boundaries), a final chunk carrying finish_reason and
  * usage, then the `data: [DONE]` sentinel.
  */
+/**
+ * PATCH (tools.7): shared frame emitter for a normalized completion.
+ * Frame order: optional role frame, reasoning chunks (optional), content
+ * chunks, tool_call frames, final finish/usage frame.
+ */
+function emitCompletion(send, base, completion, opts) {
+    if (opts.roleFrame) {
+        send(chunkFrame(base, { role: "assistant", content: "" }, null));
+    }
+    if (opts.reasoning && completion.reasoning) {
+        for (const piece of chunkText(completion.reasoning, SSE_CHUNK_CHARS)) {
+            send(chunkFrame(base, { reasoning_content: piece }, null));
+        }
+    }
+    for (const piece of chunkText(completion.content, SSE_CHUNK_CHARS)) {
+        send(chunkFrame(base, { content: piece }, null));
+    }
+    if (completion.toolCalls) {
+        completion.toolCalls.forEach((call, i) => {
+            const fn = isPlainObject(call.function) ? call.function : {};
+            send(chunkFrame(base, {
+                tool_calls: [
+                    {
+                        index: i,
+                        id: typeof call.id === "string" ? call.id : `call_${i}`,
+                        type: "function",
+                        function: {
+                            name: typeof fn.name === "string" ? fn.name : "",
+                            arguments: "",
+                        },
+                    },
+                ],
+            }, null));
+            send(chunkFrame(base, {
+                tool_calls: [
+                    {
+                        index: i,
+                        function: {
+                            arguments: typeof fn.arguments === "string" ? fn.arguments : "",
+                        },
+                    },
+                ],
+            }, null));
+        });
+    }
+    send(chunkFrame(base, {}, completion.finishReason || "stop", completion.usage ? { ...completion.usage } : undefined));
+}
 function sseResponse(completion, echoModel) {
     const base = { id: completion.id, created: completion.created, model: echoModel };
     const encoder = new TextEncoder();
@@ -483,48 +530,7 @@ function sseResponse(completion, echoModel) {
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
             };
             try {
-                send(chunkFrame(base, { role: "assistant", content: "" }, null));
-                // PATCH (tools.5): stream reasoning first so clients render the
-                // thinking block (and its elapsed time) before the answer.
-                if (completion.reasoning) {
-                    for (const piece of chunkText(completion.reasoning, SSE_CHUNK_CHARS)) {
-                        send(chunkFrame(base, { reasoning_content: piece }, null));
-                    }
-                }
-                for (const piece of chunkText(completion.content, SSE_CHUNK_CHARS)) {
-                    send(chunkFrame(base, { content: piece }, null));
-                }
-                // PATCH: stream tool_calls as OpenAI-style deltas (one header frame
-                // with id/name, one frame carrying the full arguments string).
-                if (completion.toolCalls) {
-                    completion.toolCalls.forEach((call, i) => {
-                        const fn = isPlainObject(call.function) ? call.function : {};
-                        send(chunkFrame(base, {
-                            tool_calls: [
-                                {
-                                    index: i,
-                                    id: typeof call.id === "string" ? call.id : `call_${i}`,
-                                    type: "function",
-                                    function: {
-                                        name: typeof fn.name === "string" ? fn.name : "",
-                                        arguments: "",
-                                    },
-                                },
-                            ],
-                        }, null));
-                        send(chunkFrame(base, {
-                            tool_calls: [
-                                {
-                                    index: i,
-                                    function: {
-                                        arguments: typeof fn.arguments === "string" ? fn.arguments : "",
-                                    },
-                                },
-                            ],
-                        }, null));
-                    });
-                }
-                send(chunkFrame(base, {}, completion.finishReason || "stop", completion.usage ? { ...completion.usage } : undefined));
+                emitCompletion(send, base, completion, { roleFrame: true, reasoning: true });
                 controller.enqueue(encoder.encode("data: [DONE]\n\n"));
                 controller.close();
             }
@@ -538,6 +544,76 @@ function sseResponse(completion, echoModel) {
                 }
                 void error;
             }
+        },
+    });
+    return new Response(stream, {
+        status: 200,
+        headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-cache",
+            "x-accel-buffering": "no",
+        },
+    });
+}
+/**
+ * PATCH (tools.7): early-streaming response. The one-shot version above can
+ * only start streaming AFTER the function returns, so a client that times
+ * the reasoning phase from the first reasoning delta measures ~0.1 s no
+ * matter how long the function actually thought (seen live in aicode:
+ * "思考完成（耗时 0.1 秒）" for a half-minute image round). This variant
+ * opens the stream immediately, emits the role frame and a first reasoning
+ * delta right away, and only then awaits the function; the completion
+ * frames follow when it returns, so the client's measured thinking time
+ * tracks the real wait.
+ */
+function earlySseResponse(echoModel, produce) {
+    const encoder = new TextEncoder();
+    const streamId = `chatcmpl-${Date.now().toString(36)}`;
+    const created = Math.floor(Date.now() / 1000);
+    const stream = new ReadableStream({
+        start(controller) {
+            const base = { id: streamId, created, model: echoModel };
+            const send = (frame) => {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+            };
+            try {
+                send(chunkFrame(base, { role: "assistant", content: "" }, null));
+                send(chunkFrame(base, { reasoning_content: "思考中…" }, null));
+            }
+            catch {
+                /* consumer went away before we even started */
+            }
+            produce().then((completion) => {
+                try {
+                    emitCompletion(send, base, completion, { roleFrame: false, reasoning: true });
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                }
+                catch {
+                    try {
+                        controller.close();
+                    }
+                    catch {
+                        /* already closed */
+                    }
+                }
+            }, (error) => {
+                try {
+                    const msg = error instanceof Error ? error.message : "unknown error";
+                    send(chunkFrame(base, { content: `（请求失败：${msg}）` }, null));
+                    send(chunkFrame(base, {}, "stop"));
+                    controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                    controller.close();
+                }
+                catch {
+                    try {
+                        controller.close();
+                    }
+                    catch {
+                        /* already closed */
+                    }
+                }
+            });
         },
     });
     return new Response(stream, {
@@ -661,70 +737,110 @@ async function bridgeFetch(input, init) {
         return errorResponse(413, `Conversation payload too large (${payloadBytes} bytes; limit ${DEFAULT_MAX_EVENT_BYTES} bytes). Trim the history and retry.`, { code: "PAYLOAD_TOO_LARGE" });
     }
     log("debug", `invoke ${cfg.functionName} model=${model} stream=${stream} bytes=${payloadBytes}`);
-    const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs);
-    const signal = combineSignals(init?.signal, timeoutSignal);
-    let upstream;
-    try {
-        upstream = await fetch(invokeUrl(cfg), {
-            method: "POST",
-            headers: {
-                "content-type": "application/json",
-                accept: "application/json",
-                "user-agent": USER_AGENT,
-                // The CloudBase API Key travels only in this request header, which is
-                // built here and never logged. Incoming gateway headers (which may
-                // carry it as well) are ignored, not echoed.
-                authorization: `Bearer ${cfg.apiKey}`,
-            },
-            body: payload,
-            signal,
+    // PATCH (tools.7): the invoke runs inside a closure so streaming
+    // requests can open the SSE stream first (earlySseResponse) and run
+    // it in the background; error paths keep returning plain Responses,
+    // which the streaming caller converts into an in-stream error line.
+    const runInvoke = async () => {
+        const timeoutSignal = AbortSignal.timeout(cfg.timeoutMs);
+        const signal = combineSignals(init?.signal, timeoutSignal);
+        let upstream;
+        try {
+            upstream = await fetch(invokeUrl(cfg), {
+                method: "POST",
+                headers: {
+                    "content-type": "application/json",
+                    accept: "application/json",
+                    "user-agent": USER_AGENT,
+                    // The CloudBase API Key travels only in this request header, which is
+                    // built here and never logged. Incoming gateway headers (which may
+                    // carry it as well) are ignored, not echoed.
+                    authorization: `Bearer ${cfg.apiKey}`,
+                },
+                body: payload,
+                signal,
+            });
+        }
+        catch (error) {
+            if (init?.signal?.aborted) {
+                // The agent cancelled; propagate the abort so the gateway cleans up.
+                throw error;
+            }
+            if (timeoutSignal.aborted) {
+                log("warn", `invoke timeout after ${cfg.timeoutMs} ms (model=${model})`);
+                return errorResponse(504, `CloudBase function invocation timed out after ${Math.round(cfg.timeoutMs / 1000)} s. Raise the aiProxy timeout (recommended 120 s) or options.timeoutMs.`, { code: "INVOKE_TIMEOUT" });
+            }
+            const reason = error instanceof Error ? truncate(error.message, 200) : "unknown network error";
+            log("error", `invoke network failure: ${reason}`);
+            return errorResponse(502, `Could not reach the CloudBase gateway: ${reason}`, { code: "NETWORK_ERROR" });
+        }
+        if (!upstream.ok) {
+            const text = await upstream.text().catch(() => "");
+            const mapped = mapGatewayError(upstream.status, parseGatewayErrorBody(text));
+            log("warn", `invoke failed status=${upstream.status} code=${upstream.headers.get("x-request-id") ?? "-"}`);
+            return mapped;
+        }
+        const responseText = await upstream.text();
+        let functionResult;
+        try {
+            functionResult = JSON.parse(responseText);
+        }
+        catch {
+            log("error", "aiProxy returned non-JSON body");
+            return errorResponse(502, `aiProxy returned a non-JSON body (starts with: ${truncate(responseText.slice(0, 24), 60)}). Redeploy the function from this repository.`, { code: "INVALID_FUNCTION_JSON" });
+        }
+        // aiProxy error envelope (it always reports failures inside HTTP 200).
+        if (isPlainObject(functionResult) && isPlainObject(functionResult.error)) {
+            const mapped = mapFunctionError(functionResult.error, upstream.headers.get("x-request-id") ?? undefined);
+            log("warn", `aiProxy error envelope: ${typeof functionResult.error.code === "string" ? functionResult.error.code : "unknown"}`);
+            return mapped;
+        }
+        const completion = model === IMAGE_MODEL_ID ? normalizeImageCompletion(functionResult) : normalizeCompletion(functionResult);
+        if (!completion) {
+            log("error", "aiProxy reply is not a Chat Completions object");
+            return errorResponse(502, "aiProxy reply is missing `choices[0].message`. Make sure the deployed aiProxy matches this plugin version (see docs/deploy-aiproxy.md).", { code: "INVALID_FUNCTION_RESPONSE" });
+        }
+        return completion;
+    };
+    // PATCH (tools.7): streaming requests open the SSE stream immediately so
+    // the client's thinking timer measures the real function wait. An
+    // already-aborted request must still reject like native fetch (the
+    // in-stream error fallback must not swallow that contract).
+    if (stream && init?.signal?.aborted) {
+        throw init.signal.reason ?? new Error("The operation was aborted");
+    }
+    if (stream) {
+        return earlySseResponse(rawModel, async () => {
+            const outcome = await runInvoke();
+            if (outcome instanceof Response) {
+                let msg = `HTTP ${outcome.status}`;
+                try {
+                    const parsedErr = JSON.parse(await outcome.text());
+                    if (isPlainObject(parsedErr) && isPlainObject(parsedErr.error) && typeof parsedErr.error.message === "string") {
+                        msg = parsedErr.error.message;
+                    }
+                }
+                catch {
+                    /* keep the status-based message */
+                }
+                throw new Error(msg);
+            }
+            const durationMs = Date.now() - startedAt;
+            const totalTokens = outcome.usage?.total_tokens;
+            log("info", `invoke ok model=${model} stream=${stream} ${durationMs} ms tokens=${typeof totalTokens === "number" ? totalTokens : "n/a"}`);
+            return outcome;
         });
     }
-    catch (error) {
-        if (init?.signal?.aborted) {
-            // The agent cancelled; propagate the abort so the gateway cleans up.
-            throw error;
-        }
-        if (timeoutSignal.aborted) {
-            log("warn", `invoke timeout after ${cfg.timeoutMs} ms (model=${model})`);
-            return errorResponse(504, `CloudBase function invocation timed out after ${Math.round(cfg.timeoutMs / 1000)} s. Raise the aiProxy timeout (recommended 120 s) or options.timeoutMs.`, { code: "INVOKE_TIMEOUT" });
-        }
-        const reason = error instanceof Error ? truncate(error.message, 200) : "unknown network error";
-        log("error", `invoke network failure: ${reason}`);
-        return errorResponse(502, `Could not reach the CloudBase gateway: ${reason}`, { code: "NETWORK_ERROR" });
-    }
-    if (!upstream.ok) {
-        const text = await upstream.text().catch(() => "");
-        const mapped = mapGatewayError(upstream.status, parseGatewayErrorBody(text));
-        log("warn", `invoke failed status=${upstream.status} code=${upstream.headers.get("x-request-id") ?? "-"}`);
-        return mapped;
-    }
-    const responseText = await upstream.text();
-    let functionResult;
-    try {
-        functionResult = JSON.parse(responseText);
-    }
-    catch {
-        log("error", "aiProxy returned non-JSON body");
-        return errorResponse(502, `aiProxy returned a non-JSON body (starts with: ${truncate(responseText.slice(0, 24), 60)}). Redeploy the function from this repository.`, { code: "INVALID_FUNCTION_JSON" });
-    }
-    // aiProxy error envelope (it always reports failures inside HTTP 200).
-    if (isPlainObject(functionResult) && isPlainObject(functionResult.error)) {
-        const mapped = mapFunctionError(functionResult.error, upstream.headers.get("x-request-id") ?? undefined);
-        log("warn", `aiProxy error envelope: ${typeof functionResult.error.code === "string" ? functionResult.error.code : "unknown"}`);
-        return mapped;
-    }
-    const completion = model === IMAGE_MODEL_ID ? normalizeImageCompletion(functionResult) : normalizeCompletion(functionResult);
-    if (!completion) {
-        log("error", "aiProxy reply is not a Chat Completions object");
-        return errorResponse(502, "aiProxy reply is missing `choices[0].message`. Make sure the deployed aiProxy matches this plugin version (see docs/deploy-aiproxy.md).", { code: "INVALID_FUNCTION_RESPONSE" });
-    }
+    const outcome = await runInvoke();
+    if (outcome instanceof Response)
+        return outcome;
+    const completion = outcome;
     const durationMs = Date.now() - startedAt;
     const totalTokens = completion.usage?.total_tokens;
     log("info", `invoke ok model=${model} stream=${stream} ${durationMs} ms tokens=${typeof totalTokens === "number" ? totalTokens : "n/a"}`);
     // Echo the model id exactly as the agent requested it (prefix included)
     // so clients keep seeing the identity they asked for.
-    return stream ? sseResponse(completion, rawModel) : jsonCompletionResponse(completion, rawModel);
+    return jsonCompletionResponse(completion, rawModel);
 }
 async function invokePing(cfg) {
     const upstream = await fetch(invokeUrl(cfg), {
@@ -921,6 +1037,7 @@ export const _internal = {
     normalizeCompletion,
     chunkText,
     sseResponse,
+    earlySseResponse,
     jsonCompletionResponse,
     errorResponse,
     mapGatewayError,
