@@ -36,7 +36,7 @@
  * this file is bundled standalone into dist/index.js).               *
  * ------------------------------------------------------------------ */
 
-export const PLUGIN_VERSION = "0.2.4-tools.7" as const;
+export const PLUGIN_VERSION = "0.2.4-tools.8" as const;
 
 /** Requested provider id. If Magpie already uses it, the host renames the
  * provider to `cloudbase-plugin`; both prefixes are accepted on input. */
@@ -502,7 +502,23 @@ function buildInvokeEvent(body: ChatCompletionsBody, model: string): Json {
     event.max_tokens = body.max_tokens;
   }
   if (Array.isArray(body.tools) && body.tools.length > 0) {
-    event.tools = body.tools;
+    // PATCH (tools.8): for auto models, drop the client's native generateImage
+    // tool before forwarding. aicode's native image tool expects an
+    // images-API-shaped reply; this chain answers with a chat completion, so
+    // the tool reports "drew nothing" (with the image URL truncated) and the
+    // model retries it in a loop. In auto mode the aiProxy state machine and
+    // its server-side generate_image tool cover image generation end-to-end,
+    // so the native tool is only a trap. Other models keep it untouched.
+    const isAuto = /^auto(-.+)?$/.test(model);
+    const kept = isAuto
+      ? body.tools.filter((t) => {
+          if (!isPlainObject(t)) return true;
+          const fn = isPlainObject(t.function) ? t.function : null;
+          const name = fn && typeof fn.name === "string" ? fn.name : typeof t.name === "string" ? t.name : "";
+          return name !== "generateImage";
+        })
+      : body.tools;
+    if (kept.length > 0) event.tools = kept;
   }
   if (typeof body.tool_choice !== "undefined") {
     event.tool_choice = body.tool_choice;
